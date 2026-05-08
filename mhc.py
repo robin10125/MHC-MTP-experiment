@@ -54,7 +54,7 @@ import torch.nn.functional as F
 # Sinkhorn-Knopp projection onto the Birkhoff polytope
 # ---------------------------------------------------------------------------
 
-def sinkhorn(W: torch.Tensor, n_iters: int = 20, eps: float = 1e-8) -> torch.Tensor:
+def sinkhorn(W: torch.Tensor, n_iters: int = 5, eps: float = 1e-8) -> torch.Tensor:
     """
     Project matrix W onto the Birkhoff polytope (doubly stochastic matrices).
 
@@ -68,8 +68,7 @@ def sinkhorn(W: torch.Tensor, n_iters: int = 20, eps: float = 1e-8) -> torch.Ten
 
     Args:
         W       : (..., n, n)  raw (unconstrained) parameter matrix
-        n_iters : number of alternating normalisation steps  (20 is the
-                  default from the mHC paper; 5 is sufficient in practice)
+        n_iters : number of alternating normalisation steps
         eps     : small constant for numerical stability
 
     Returns:
@@ -94,7 +93,7 @@ class mHCResidual(nn.Module):
 
         1. Read    x  = sum_i  softmax(H_pre)_i * X[:,:,i,:]     -> (B,T,d)
         2. Compute y  = sublayer( norm(x) )                       -> (B,T,d)
-        3. Mix     X' = einsum("ij,btjd->btid", H_res, X)         lateral mix
+        3. Mix     X' = matmul(H_res, X) across stream dimension  lateral mix
         4. Write   X' = X' + H_post[:,None] * y                   broadcast write
 
     H_res is projected to the Birkhoff polytope on every forward pass so its
@@ -117,7 +116,7 @@ class mHCResidual(nn.Module):
         layer_idx: int,
         sublayer: nn.Module,
         norm_cls=None,
-        sinkhorn_iters: int = 20,
+        sinkhorn_iters: int = 5,
     ):
         super().__init__()
 
@@ -181,15 +180,16 @@ class mHCResidual(nn.Module):
 
         # ---- Step 1: Read -----------------------------------------------
         # Weighted combination of streams -> single input vector for sublayer
-        read_w = F.softmax(self.H_pre, dim=0)                      # (n,)
-        x = (streams * read_w.view(1, 1, n, 1)).sum(dim=2)         # (B, T, d)
+        read_w = F.softmax(self.H_pre, dim=0)                     # (n,)
+        x = torch.matmul(streams.transpose(-1, -2), read_w)       # (B, T, d)
 
         # ---- Step 2: Sublayer -------------------------------------------
         y = self.sublayer(self.norm(x))                            # (B, T, d)
 
         # ---- Step 3: Lateral mix ----------------------------------------
         H_res = sinkhorn(self.H_res_raw, n_iters=self.sinkhorn_iters)  # (n, n)
-        streams = torch.einsum("ij,btjd->btid", H_res, streams)        # (B, T, n, d)
+        streams = torch.matmul(H_res, streams.reshape(B * T, n, d))
+        streams = streams.reshape(B, T, n, d)
 
         # ---- Step 4: Write-back -----------------------------------------
         streams = streams + self.H_post.view(1, 1, n, 1) * y.unsqueeze(2)
@@ -213,9 +213,6 @@ class CausalSelfAttention(nn.Module):
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
-        causal_mask = torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool))
-        self.register_buffer("causal_mask", causal_mask)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, d = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
@@ -224,13 +221,12 @@ class CausalSelfAttention(nn.Module):
             return t.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
         q, k, v = split(q), split(k), split(v)
-        scale = math.sqrt(self.head_dim)
-        attn = (q @ k.transpose(-2, -1)) / scale
-        attn = attn.masked_fill(
-            ~self.causal_mask[:T, :T].unsqueeze(0).unsqueeze(0), float("-inf")
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=0.0,
+            is_causal=True,
         )
-        attn = F.softmax(attn, dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, T, d)
+        out = out.transpose(1, 2).reshape(B, T, d)
         return self.out_proj(out)
 
 
@@ -277,6 +273,7 @@ class mHCTransformerBlock(nn.Module):
         layer_idx: int,
         ffn_mult: int = 4,
         max_seq_len: int = 2048,
+        sinkhorn_iters: int = 5,
     ):
         super().__init__()
 
@@ -285,6 +282,7 @@ class mHCTransformerBlock(nn.Module):
             n_streams=n_streams,
             layer_idx=layer_idx * 2,
             sublayer=CausalSelfAttention(d_model, n_heads, max_seq_len),
+            sinkhorn_iters=sinkhorn_iters,
         )
 
         self.ffn_mhc = mHCResidual(
@@ -292,6 +290,7 @@ class mHCTransformerBlock(nn.Module):
             n_streams=n_streams,
             layer_idx=layer_idx * 2 + 1,
             sublayer=SwiGLUFFN(d_model, ffn_mult),
+            sinkhorn_iters=sinkhorn_iters,
         )
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
