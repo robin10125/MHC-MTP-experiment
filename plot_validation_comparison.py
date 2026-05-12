@@ -6,6 +6,8 @@ Reads each run's `metrics.csv` and produces:
   - validation loss versus elapsed wall-clock minutes
   - train loss versus optimizer step
   - train loss versus elapsed wall-clock minutes
+  - train main loss versus elapsed wall-clock minutes
+  - train main loss versus optimizer step
 
 Example:
     python plot_validation_comparison.py --run_dir runs_baselines_20min
@@ -29,6 +31,7 @@ class Series:
     train_total_steps: list[int]
     train_total_minutes: list[float]
     train_total: list[float]
+    train_main: list[float]
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +55,18 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Moving-average window for train loss plots. Use 1 for raw per-step loss.",
     )
+    parser.add_argument(
+        "--start_minutes",
+        type=float,
+        default=0.0,
+        help="Only plot points at or after this elapsed minute.",
+    )
+    parser.add_argument(
+        "--yscale",
+        choices=["linear", "log"],
+        default="linear",
+        help="Y-axis scale for loss plots.",
+    )
     return parser.parse_args()
 
 
@@ -64,6 +79,7 @@ def read_series(metrics_path: Path) -> Series:
     train_steps: list[int] = []
     train_minutes: list[float] = []
     train_total: list[float] = []
+    train_main: list[float] = []
 
     with metrics_path.open(newline="") as f:
         for row in csv.DictReader(f):
@@ -73,6 +89,7 @@ def read_series(metrics_path: Path) -> Series:
                 train_steps.append(step)
                 train_minutes.append(elapsed_minutes)
                 train_total.append(float(row["train_total_loss"]))
+                train_main.append(float(row["train_main_loss"]))
             if row.get("val_total_loss"):
                 steps.append(step)
                 minutes.append(elapsed_minutes)
@@ -91,6 +108,7 @@ def read_series(metrics_path: Path) -> Series:
         train_total_steps=train_steps,
         train_total_minutes=train_minutes,
         train_total=train_total,
+        train_main=train_main,
     )
 
 
@@ -128,6 +146,7 @@ def plot_lines(
     title: str,
     out_path: Path,
     smooth_window: int = 1,
+    yscale: str = "linear",
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -145,6 +164,12 @@ def plot_lines(
         if not x or not y:
             continue
         y = moving_average(y, smooth_window)
+        if yscale == "log":
+            pairs = [(x_i, y_i) for x_i, y_i in zip(x, y) if y_i > 0]
+            if not pairs:
+                continue
+            x = [x_i for x_i, _ in pairs]
+            y = [y_i for _, y_i in pairs]
         style = styles.get(item.name, {"linestyle": "-", "marker": "o", "zorder": 2})
         ax.plot(
             x,
@@ -158,11 +183,37 @@ def plot_lines(
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
+    ax.set_yscale(yscale)
     ax.grid(True, alpha=0.25)
     ax.legend()
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
+
+
+def filter_series_by_start_minutes(series: list[Series], start_minutes: float) -> list[Series]:
+    if start_minutes <= 0:
+        return series
+
+    filtered: list[Series] = []
+    for item in series:
+        val_keep = [idx for idx, minute in enumerate(item.minutes) if minute >= start_minutes]
+        train_keep = [
+            idx for idx, minute in enumerate(item.train_total_minutes)
+            if minute >= start_minutes
+        ]
+        filtered.append(Series(
+            name=item.name,
+            steps=[item.steps[idx] for idx in val_keep],
+            minutes=[item.minutes[idx] for idx in val_keep],
+            val_total=[item.val_total[idx] for idx in val_keep],
+            val_main=[item.val_main[idx] for idx in val_keep],
+            train_total_steps=[item.train_total_steps[idx] for idx in train_keep],
+            train_total_minutes=[item.train_total_minutes[idx] for idx in train_keep],
+            train_total=[item.train_total[idx] for idx in train_keep],
+            train_main=[item.train_main[idx] for idx in train_keep],
+        ))
+    return filtered
 
 
 def main() -> int:
@@ -172,53 +223,89 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     series = [read_series(path) for path in find_metric_files(run_dir, args.models)]
+    series_to_plot = filter_series_by_start_minutes(series, args.start_minutes)
+    suffix = ""
+    title_suffix = ""
+    if args.start_minutes > 0:
+        suffix = f"_from_{args.start_minutes:g}min"
+        title_suffix = f" from {args.start_minutes:g} min"
+    if args.yscale == "log":
+        suffix += "_logy"
+        title_suffix += " (log y)"
 
     plot_lines(
-        series,
+        series_to_plot,
         "steps",
         "val_total",
         "Training step",
         "Validation total loss",
-        f"{args.title}: validation loss vs step",
-        out_dir / f"validation_loss_vs_step.{args.format}",
+        f"{args.title}: validation loss vs step{title_suffix}",
+        out_dir / f"validation_loss_vs_step{suffix}.{args.format}",
+        yscale=args.yscale,
     )
     plot_lines(
-        series,
+        series_to_plot,
         "minutes",
         "val_total",
         "Elapsed minutes",
         "Validation total loss",
-        f"{args.title}: validation loss vs time",
-        out_dir / f"validation_loss_vs_time.{args.format}",
+        f"{args.title}: validation loss vs time{title_suffix}",
+        out_dir / f"validation_loss_vs_time{suffix}.{args.format}",
+        yscale=args.yscale,
     )
     plot_lines(
-        series,
+        series_to_plot,
         "minutes",
         "val_main",
         "Elapsed minutes",
         "Validation main loss",
-        f"{args.title}: validation main loss vs time",
-        out_dir / f"validation_main_loss_vs_time.{args.format}",
+        f"{args.title}: validation main loss vs time{title_suffix}",
+        out_dir / f"validation_main_loss_vs_time{suffix}.{args.format}",
+        yscale=args.yscale,
     )
     plot_lines(
-        series,
+        series_to_plot,
         "train_total_minutes",
         "train_total",
         "Elapsed minutes",
         f"Training total loss ({args.train_smooth}-step moving average)",
-        f"{args.title}: training loss vs time",
-        out_dir / f"training_loss_vs_time.{args.format}",
+        f"{args.title}: training loss vs time{title_suffix}",
+        out_dir / f"training_loss_vs_time{suffix}.{args.format}",
         smooth_window=args.train_smooth,
+        yscale=args.yscale,
     )
     plot_lines(
-        series,
+        series_to_plot,
+        "train_total_minutes",
+        "train_main",
+        "Elapsed minutes",
+        f"Training main loss ({args.train_smooth}-step moving average)",
+        f"{args.title}: training main loss vs time{title_suffix}",
+        out_dir / f"training_main_loss_vs_time{suffix}.{args.format}",
+        smooth_window=args.train_smooth,
+        yscale=args.yscale,
+    )
+    plot_lines(
+        series_to_plot,
+        "train_total_steps",
+        "train_main",
+        "Training step",
+        f"Training main loss ({args.train_smooth}-step moving average)",
+        f"{args.title}: training main loss vs step{title_suffix}",
+        out_dir / f"training_main_loss_vs_step{suffix}.{args.format}",
+        smooth_window=args.train_smooth,
+        yscale=args.yscale,
+    )
+    plot_lines(
+        series_to_plot,
         "train_total_steps",
         "train_total",
         "Training step",
         f"Training total loss ({args.train_smooth}-step moving average)",
-        f"{args.title}: training loss vs step",
-        out_dir / f"training_loss_vs_step.{args.format}",
+        f"{args.title}: training loss vs step{title_suffix}",
+        out_dir / f"training_loss_vs_step{suffix}.{args.format}",
         smooth_window=args.train_smooth,
+        yscale=args.yscale,
     )
 
     summary_path = out_dir / "validation_summary.csv"
@@ -265,12 +352,17 @@ def main() -> int:
                 "first_train_step",
                 "first_train_minutes",
                 "first_train_total",
+                "first_train_main",
                 "best_train_step",
                 "best_train_minutes",
                 "best_train_total",
+                "best_train_main",
+                "best_train_main_step",
+                "best_train_main_minutes",
                 "final_train_step",
                 "final_train_minutes",
                 "final_train_total",
+                "final_train_main",
             ],
         )
         writer.writeheader()
@@ -278,18 +370,24 @@ def main() -> int:
             if not item.train_total:
                 continue
             best_idx = min(range(len(item.train_total)), key=item.train_total.__getitem__)
+            best_main_idx = min(range(len(item.train_main)), key=item.train_main.__getitem__)
             final_idx = len(item.train_total) - 1
             writer.writerow({
                 "model": item.name,
                 "first_train_step": item.train_total_steps[0],
                 "first_train_minutes": item.train_total_minutes[0],
                 "first_train_total": item.train_total[0],
+                "first_train_main": item.train_main[0],
                 "best_train_step": item.train_total_steps[best_idx],
                 "best_train_minutes": item.train_total_minutes[best_idx],
                 "best_train_total": item.train_total[best_idx],
+                "best_train_main": item.train_main[best_main_idx],
+                "best_train_main_step": item.train_total_steps[best_main_idx],
+                "best_train_main_minutes": item.train_total_minutes[best_main_idx],
                 "final_train_step": item.train_total_steps[final_idx],
                 "final_train_minutes": item.train_total_minutes[final_idx],
                 "final_train_total": item.train_total[final_idx],
+                "final_train_main": item.train_main[final_idx],
             })
     print(f"Wrote train summary to {train_summary_path}")
     return 0

@@ -401,8 +401,12 @@ def parse_args():
                    help="Number of sequential MTP prediction depths")
     p.add_argument("--mtp_loss_scale", type=float, default=0.3,
                    help="Weight applied to MTP loss before adding to main loss")
-    p.add_argument("--sinkhorn_iters", type=int, default=5,
+    p.add_argument("--sinkhorn_iters", type=int, default=20,
                    help="Sinkhorn iterations for mHC residuals and mix reduction")
+    p.add_argument("--mhc_identity_epsilon", type=float, default=1e-3,
+                   help="Initial off-diagonal mass before Sinkhorn for mHC near-identity mixers")
+    p.add_argument("--mhc_gate_init", type=float, default=0.01,
+                   help="Initial mHC gate alpha for identity/Sinkhorn residual mixer blend")
 
     # Training
     p.add_argument("--seq_len",     type=int, default=512)
@@ -578,6 +582,8 @@ def main():
         mtp_loss_scale = args.mtp_loss_scale,
         reduction     = args.reduction,
         sinkhorn_iters = args.sinkhorn_iters,
+        mhc_identity_epsilon = args.mhc_identity_epsilon,
+        mhc_gate_init = args.mhc_gate_init,
         lr            = args.lr,
         batch_size    = args.batch_size,
         seq_len       = args.seq_len,
@@ -697,7 +703,24 @@ def main():
         + [f"train_depth_{k}_loss" for k in range(cfg.n_mtp)]
         + ["val_total_loss", "val_main_loss", "val_ppl"]
         + [f"val_depth_{k}_loss" for k in range(cfg.n_mtp)]
-        + ["mix_weight_diag", "lr", "tokens_per_sec", "elapsed_hours"]
+        + [
+            "mix_weight_diag",
+            "mhc_row_err",
+            "mhc_col_err",
+            "mhc_diag_mass",
+            "mhc_entropy",
+            "mhc_sigma_1",
+            "mhc_sigma_2",
+            "mhc_reduction_row_err",
+            "mhc_reduction_col_err",
+            "mhc_reduction_diag_mass",
+            "mhc_reduction_entropy",
+            "mhc_reduction_sigma_1",
+            "mhc_reduction_sigma_2",
+            "lr",
+            "tokens_per_sec",
+            "elapsed_hours",
+        ]
     )
     writer = csv.DictWriter(csv_file, fieldnames=csv_cols, extrasaction="ignore")
     if start_step == 0:
@@ -721,6 +744,7 @@ def main():
     accum_mtp         = 0.0
     accum_depths      = [0.0] * cfg.n_mtp
     last_mix_diag     = None
+    last_mhc_diag     = {}
     t_loop_start      = time.perf_counter()
     t_step_start      = time.perf_counter()
     total_tokens      = 0
@@ -765,6 +789,7 @@ def main():
             accum_depths[k] += dl.item()
         if metrics["mix_weights"] is not None:
             last_mix_diag = metrics["mix_weights"].diagonal().tolist()
+        last_mhc_diag = metrics.get("mhc_diagnostics", {}) or {}
         total_tokens += input_ids.numel()
         accum_count  += 1
 
@@ -821,11 +846,18 @@ def main():
             mix_str = ""
             if last_mix_diag is not None:
                 mix_str = f"  mix_diag=[{', '.join(f'{x:.3f}' for x in last_mix_diag)}]"
+            mhc_str = ""
+            if last_mhc_diag:
+                mhc_str = (
+                    f"  mhc_diag={last_mhc_diag.get('mhc_diag_mass', 0.0):.3f}"
+                    f" ent={last_mhc_diag.get('mhc_entropy', 0.0):.3f}"
+                    f" s2={last_mhc_diag.get('mhc_sigma_2', 0.0):.3f}"
+                )
             eta_h = (args.n_steps - step) * (elapsed_h / max(step - start_step, 1))
             print(
                 f"step {step:5d}/{args.n_steps} | "
                 f"loss={avg_loss:.4f}  main={avg_main:.4f}  mtp={avg_mtp:.4f}  "
-                f"[{depth_str}]{mix_str}  "
+                f"[{depth_str}]{mix_str}{mhc_str}  "
                 f"lr={current_lr:.2e}  "
                 f"tps={tps:,.0f}  "
                 f"elapsed={elapsed_h:.2f}h  eta={eta_h:.1f}h"
@@ -877,6 +909,18 @@ def main():
             "val_main_loss":     val_metrics.get("val_main_loss", ""),
             "val_ppl":           val_metrics.get("val_ppl", ""),
             "mix_weight_diag":   str(last_mix_diag) if last_mix_diag else "",
+            "mhc_row_err":       last_mhc_diag.get("mhc_row_err", ""),
+            "mhc_col_err":       last_mhc_diag.get("mhc_col_err", ""),
+            "mhc_diag_mass":     last_mhc_diag.get("mhc_diag_mass", ""),
+            "mhc_entropy":       last_mhc_diag.get("mhc_entropy", ""),
+            "mhc_sigma_1":       last_mhc_diag.get("mhc_sigma_1", ""),
+            "mhc_sigma_2":       last_mhc_diag.get("mhc_sigma_2", ""),
+            "mhc_reduction_row_err":   last_mhc_diag.get("mhc_reduction_row_err", ""),
+            "mhc_reduction_col_err":   last_mhc_diag.get("mhc_reduction_col_err", ""),
+            "mhc_reduction_diag_mass": last_mhc_diag.get("mhc_reduction_diag_mass", ""),
+            "mhc_reduction_entropy":   last_mhc_diag.get("mhc_reduction_entropy", ""),
+            "mhc_reduction_sigma_1":   last_mhc_diag.get("mhc_reduction_sigma_1", ""),
+            "mhc_reduction_sigma_2":   last_mhc_diag.get("mhc_reduction_sigma_2", ""),
             "lr":                current_lr,
             "tokens_per_sec":    tps,
             "elapsed_hours":     elapsed_h,

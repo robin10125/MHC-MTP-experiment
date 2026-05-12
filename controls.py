@@ -54,7 +54,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mhc import mHCTransformerBlock, CausalSelfAttention, SwiGLUFFN
+from mhc import (
+    CausalSelfAttention,
+    SwiGLUFFN,
+    init_gpt_style_weights,
+    mHCTransformerBlock,
+)
 from mtp import MTPStack
 from experiment import ExperimentConfig
 
@@ -101,6 +106,8 @@ class mHCOnlyModel(nn.Module):
                 ffn_mult=cfg.ffn_mult,
                 max_seq_len=cfg.max_seq_len,
                 sinkhorn_iters=cfg.sinkhorn_iters,
+                identity_epsilon=cfg.mhc_identity_epsilon,
+                gate_init=cfg.mhc_gate_init,
             )
             for i in range(cfg.n_layers)
         ])
@@ -115,8 +122,7 @@ class mHCOnlyModel(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        with torch.no_grad():
-            self.lm_head.weight.mul_(1.0 / math.sqrt(self.n_streams))
+        init_gpt_style_weights(self, len(self.blocks))
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -140,8 +146,28 @@ class mHCOnlyModel(nn.Module):
         for block in self.blocks:
             streams = block(streams)
 
-        hidden = streams.sum(dim=2)   # (B, T, d)
+        hidden = streams.mean(dim=2)  # (B, T, d)
         return hidden                 # caller applies final_norm + lm_head
+
+    def mhc_diagnostics(self) -> dict[str, float]:
+        stats: dict[str, list[float]] = {
+            "row_err": [],
+            "col_err": [],
+            "diag_mass": [],
+            "entropy": [],
+            "sigma_1": [],
+            "sigma_2": [],
+        }
+        for block in self.blocks:
+            for residual in (block.attn_mhc, block.ffn_mhc):
+                diag = residual.diagnostics()
+                for key, value in diag.items():
+                    stats[key].append(value)
+        return {
+            f"mhc_{key}": sum(values) / len(values)
+            for key, values in stats.items()
+            if values
+        }
 
 
 class mHCOnly(nn.Module):
@@ -186,6 +212,7 @@ class mHCOnly(nn.Module):
             "mtp_loss":         torch.zeros((), device=input_ids.device),
             "per_depth_losses": [],
             "mix_weights":      None,
+            "mhc_diagnostics":  self.trunk.mhc_diagnostics(),
         }
 
     def infer(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -350,6 +377,7 @@ class ResidualOnly(nn.Module):
             "mtp_loss": torch.zeros((), device=input_ids.device),
             "per_depth_losses": [],
             "mix_weights": None,
+            "mhc_diagnostics": {},
         }
 
     def infer(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -425,6 +453,7 @@ class ResidualWithMTP(nn.Module):
             "mtp_loss":         mtp_loss,
             "per_depth_losses": per_depth,
             "mix_weights":      None,   # no mixing matrix in this control
+            "mhc_diagnostics":  {},
         }
 
     def infer(self, input_ids: torch.Tensor) -> torch.Tensor:

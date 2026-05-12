@@ -81,6 +81,93 @@ def sinkhorn(W: torch.Tensor, n_iters: int = 5, eps: float = 1e-8) -> torch.Tens
     return S
 
 
+def inverse_softplus(x: torch.Tensor | float) -> torch.Tensor:
+    """Numerically stable inverse of softplus for positive targets."""
+    target = torch.as_tensor(x)
+    return target + torch.log(-torch.expm1(-target))
+
+
+def logit(x: torch.Tensor | float) -> torch.Tensor:
+    """Numerically stable logit for values strictly inside (0, 1)."""
+    target = torch.as_tensor(x)
+    return torch.log(target) - torch.log1p(-target)
+
+
+def init_near_identity_sinkhorn_raw(
+    param: torch.Tensor,
+    identity_epsilon: float = 1e-3,
+) -> None:
+    """
+    Initialise a raw Sinkhorn parameter so softplus(raw) is near identity.
+
+    Setting off-diagonal raw values to zero is not very identity-like because
+    softplus(0) ~= 0.693.  This initialises the positive pre-Sinkhorn matrix
+    to diag=1 and offdiag=identity_epsilon instead.
+    """
+    if identity_epsilon <= 0:
+        raise ValueError("identity_epsilon must be positive")
+    with torch.no_grad():
+        target = torch.full_like(param, identity_epsilon)
+        target.diagonal().fill_(1.0)
+        param.copy_(inverse_softplus(target).to(device=param.device, dtype=param.dtype))
+
+
+def init_gpt_style_weights(module: nn.Module, n_layers: int) -> None:
+    """
+    Match the residual baseline's GPT-style initialization.
+
+    Skips HC parameters and tied LM heads; tied heads share the embedding
+    tensor, so initializing the embedding is sufficient.
+    """
+    std = 0.02
+    rescale_std = std / math.sqrt(2 * n_layers)
+    for name, child in module.named_modules():
+        if isinstance(child, nn.Linear):
+            if name.endswith("lm_head"):
+                continue
+            nn.init.normal_(child.weight, mean=0.0, std=std)
+            if child.bias is not None:
+                nn.init.zeros_(child.bias)
+        elif isinstance(child, nn.Embedding):
+            nn.init.normal_(child.weight, mean=0.0, std=std)
+
+    for child in module.modules():
+        if isinstance(child, CausalSelfAttention):
+            nn.init.normal_(child.out_proj.weight, std=rescale_std)
+        elif isinstance(child, SwiGLUFFN):
+            nn.init.normal_(child.down.weight, std=rescale_std)
+
+
+def doubly_stochastic_diagnostics(S: torch.Tensor, eps: float = 1e-8) -> dict[str, float]:
+    """
+    Summarise a doubly-stochastic stream mixer for stability monitoring.
+
+    Returns Python floats so callers can write them directly to CSV.
+    """
+    with torch.no_grad():
+        S32 = S.detach().float()
+        n = S32.size(-1)
+        row_err = (S32.sum(dim=-1) - 1.0).abs().max().item()
+        col_err = (S32.sum(dim=-2) - 1.0).abs().max().item()
+        diag_mass = S32.diagonal(dim1=-2, dim2=-1).sum(dim=-1).mean().item()
+        entropy = -(S32.clamp_min(eps) * S32.clamp_min(eps).log()).sum(dim=-1).mean().item()
+        singular_values = torch.linalg.svdvals(S32)
+        sigma_1 = singular_values[..., 0].mean().item()
+        sigma_2 = (
+            singular_values[..., 1].mean().item()
+            if n > 1
+            else 0.0
+        )
+    return {
+        "row_err": row_err,
+        "col_err": col_err,
+        "diag_mass": diag_mass,
+        "entropy": entropy,
+        "sigma_1": sigma_1,
+        "sigma_2": sigma_2,
+    }
+
+
 # ---------------------------------------------------------------------------
 # mHC residual wrapper
 # ---------------------------------------------------------------------------
@@ -116,7 +203,9 @@ class mHCResidual(nn.Module):
         layer_idx: int,
         sublayer: nn.Module,
         norm_cls=None,
-        sinkhorn_iters: int = 5,
+        sinkhorn_iters: int = 20,
+        identity_epsilon: float = 1e-3,
+        gate_init: float = 0.01,
     ):
         super().__init__()
 
@@ -125,6 +214,8 @@ class mHCResidual(nn.Module):
         self.layer_idx = layer_idx
         self.sublayer = sublayer
         self.sinkhorn_iters = sinkhorn_iters
+        self.identity_epsilon = identity_epsilon
+        self.gate_init = gate_init
 
         if norm_cls is None:
             norm_cls = nn.RMSNorm
@@ -137,8 +228,12 @@ class mHCResidual(nn.Module):
         # Read weights: (n,) -> softmax -> convex combination of streams.
         self.H_pre = nn.Parameter(torch.empty(n_streams))
 
-        # Write weights: (n,) scalar multiplier per stream for the write-back.
-        self.H_post = nn.Parameter(torch.empty(n_streams))
+        # Write weights: constrained with softplus in forward().
+        self.H_post_raw = nn.Parameter(torch.empty(n_streams))
+
+        # mHC gating factor: convexly blends identity and the learned
+        # Sinkhorn-projected matrix. DeepSeek reports alpha init 0.01.
+        self.H_res_gate_raw = nn.Parameter(torch.empty(()))
 
         self._init_parameters()
 
@@ -150,8 +245,7 @@ class mHCResidual(nn.Module):
         # H_res_raw: set large diagonal so that after softplus + Sinkhorn
         # the result is approximately the identity matrix.
         with torch.no_grad():
-            self.H_res_raw.fill_(0.0)
-            self.H_res_raw.diagonal().fill_(10.0)
+            init_near_identity_sinkhorn_raw(self.H_res_raw, self.identity_epsilon)
 
         # H_pre: rotating one-hot  (symmetry breaking across streams)
         read_stream = self.layer_idx % n
@@ -161,9 +255,14 @@ class mHCResidual(nn.Module):
             # The other entries are 0, giving softmax ≈ e_{read_stream}.
             self.H_pre[read_stream] = 10.0
 
-        # H_post: uniform write-back into all streams
+        # H_post: positive uniform write-back into all streams
         with torch.no_grad():
-            self.H_post.fill_(1.0)
+            self.H_post_raw.copy_(
+                inverse_softplus(torch.ones_like(self.H_post_raw))
+            )
+            self.H_res_gate_raw.copy_(
+                logit(torch.tensor(self.gate_init, device=self.H_res_gate_raw.device))
+            )
 
     # ------------------------------------------------------------------
 
@@ -187,14 +286,32 @@ class mHCResidual(nn.Module):
         y = self.sublayer(self.norm(x))                            # (B, T, d)
 
         # ---- Step 3: Lateral mix ----------------------------------------
-        H_res = sinkhorn(self.H_res_raw, n_iters=self.sinkhorn_iters)  # (n, n)
+        H_res_projected = sinkhorn(self.H_res_raw, n_iters=self.sinkhorn_iters)  # (n, n)
+        gate = torch.sigmoid(self.H_res_gate_raw)
+        H_identity = torch.eye(n, device=streams.device, dtype=streams.dtype)
+        H_res = (1.0 - gate) * H_identity + gate * H_res_projected
         streams = torch.matmul(H_res, streams.reshape(B * T, n, d))
         streams = streams.reshape(B, T, n, d)
 
         # ---- Step 4: Write-back -----------------------------------------
-        streams = streams + self.H_post.view(1, 1, n, 1) * y.unsqueeze(2)
+        H_post = F.softplus(self.H_post_raw)
+        streams = streams + H_post.view(1, 1, n, 1) * y.unsqueeze(2)
 
         return streams
+
+    def mixing_weights(self) -> torch.Tensor:
+        with torch.no_grad():
+            projected = sinkhorn(self.H_res_raw, n_iters=self.sinkhorn_iters)
+            gate = torch.sigmoid(self.H_res_gate_raw)
+            identity = torch.eye(
+                self.n_streams,
+                device=projected.device,
+                dtype=projected.dtype,
+            )
+            return (1.0 - gate) * identity + gate * projected
+
+    def diagnostics(self) -> dict[str, float]:
+        return doubly_stochastic_diagnostics(self.mixing_weights())
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +390,9 @@ class mHCTransformerBlock(nn.Module):
         layer_idx: int,
         ffn_mult: int = 4,
         max_seq_len: int = 2048,
-        sinkhorn_iters: int = 5,
+        sinkhorn_iters: int = 20,
+        identity_epsilon: float = 1e-3,
+        gate_init: float = 0.01,
     ):
         super().__init__()
 
@@ -283,6 +402,8 @@ class mHCTransformerBlock(nn.Module):
             layer_idx=layer_idx * 2,
             sublayer=CausalSelfAttention(d_model, n_heads, max_seq_len),
             sinkhorn_iters=sinkhorn_iters,
+            identity_epsilon=identity_epsilon,
+            gate_init=gate_init,
         )
 
         self.ffn_mhc = mHCResidual(
@@ -291,6 +412,8 @@ class mHCTransformerBlock(nn.Module):
             layer_idx=layer_idx * 2 + 1,
             sublayer=SwiGLUFFN(d_model, ffn_mult),
             sinkhorn_iters=sinkhorn_iters,
+            identity_epsilon=identity_epsilon,
+            gate_init=gate_init,
         )
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
@@ -336,6 +459,9 @@ class mHCModel(nn.Module):
         n_streams: int = 4,
         max_seq_len: int = 2048,
         ffn_mult: int = 4,
+        sinkhorn_iters: int = 20,
+        identity_epsilon: float = 1e-3,
+        gate_init: float = 0.01,
     ):
         super().__init__()
         self.n_streams = n_streams
@@ -352,6 +478,9 @@ class mHCModel(nn.Module):
                 layer_idx=i,
                 ffn_mult=ffn_mult,
                 max_seq_len=max_seq_len,
+                sinkhorn_iters=sinkhorn_iters,
+                identity_epsilon=identity_epsilon,
+                gate_init=gate_init,
             )
             for i in range(n_layers)
         ])
@@ -365,10 +494,7 @@ class mHCModel(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Scale output projection down by 1/sqrt(n_streams) to compensate
-        # for the sum reduction producing n-fold larger magnitude at init.
-        with torch.no_grad():
-            self.lm_head.weight.mul_(1.0 / math.sqrt(self.n_streams))
+        init_gpt_style_weights(self, len(self.blocks))
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -391,8 +517,7 @@ class mHCModel(nn.Module):
         for block in self.blocks:
             streams = block(streams)
 
-        # Sum reduction + 1/sqrt(n) is implicit in the LM head weight scaling
-        x = streams.sum(dim=2)          # (B, T, d)
+        x = streams.mean(dim=2)         # (B, T, d)
         x = self.final_norm(x)
         return self.lm_head(x)          # (B, T, vocab_size)
 

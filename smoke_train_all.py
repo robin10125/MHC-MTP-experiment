@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--n_streams", type=int, default=4)
     parser.add_argument("--n_mtp", type=int, default=1)
-    parser.add_argument("--sinkhorn_iters", type=int, default=5)
+    parser.add_argument("--sinkhorn_iters", type=int, default=20)
     return parser.parse_args()
 
 

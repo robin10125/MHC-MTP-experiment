@@ -34,7 +34,7 @@ Architecture overview
         │
         ▼  (B, T, n_streams, d)
     StreamReduction                 ← the thing being ablated
-        │  sum:   streams.sum(dim=2)                     plain, no parameters
+        │  sum:   streams.mean(dim=2)                    plain, no parameters
         │  mix:   sinkhorn(W) @ streams, W learned       doubly stochastic
         ▼  (B, T, d)
     final_norm
@@ -84,7 +84,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Local modules — mhc.py and mtp.py must be in the same directory
-from mhc import mHCResidual, mHCTransformerBlock, sinkhorn
+from mhc import (
+    doubly_stochastic_diagnostics,
+    init_near_identity_sinkhorn_raw,
+    init_gpt_style_weights,
+    logit,
+    mHCResidual,
+    mHCTransformerBlock,
+    sinkhorn,
+)
 from mtp import MTPStack
 
 
@@ -116,7 +124,9 @@ class ExperimentConfig:
 
     # --- Reduction strategy (the experimental variable) ---
     reduction: Literal["sum", "mix"] = "sum"
-    sinkhorn_iters: int = 5    # for both H_res in trunk and mixing matrix
+    sinkhorn_iters: int = 20   # for both H_res in trunk and mixing matrix
+    mhc_identity_epsilon: float = 1e-3
+    mhc_gate_init: float = 0.01
 
     # --- Training ---
     lr:          float = 3e-4
@@ -158,7 +168,7 @@ class SumReduction(nn.Module):
         Returns:
             h       : (B, T, d_model)
         """
-        return streams.sum(dim=2)
+        return streams.mean(dim=2)
 
     def mixing_weights(self) -> Optional[torch.Tensor]:
         """Returns None — no learned weights to inspect."""
@@ -202,16 +212,29 @@ class SinkhornMixReduction(nn.Module):
         sinkhorn_iters : Sinkhorn-Knopp iterations per forward pass
     """
 
-    def __init__(self, n_streams: int, d_model: int, sinkhorn_iters: int = 5):
+    def __init__(
+        self,
+        n_streams: int,
+        d_model: int,
+        sinkhorn_iters: int = 20,
+        identity_epsilon: float = 1e-3,
+        gate_init: float = 0.01,
+    ):
         super().__init__()
         self.n_streams = n_streams
         self.sinkhorn_iters = sinkhorn_iters
+        self.identity_epsilon = identity_epsilon
+        self.gate_init = gate_init
 
         # Raw parameter: initialised so softplus(W_raw) after Sinkhorn ≈ identity.
         # Large diagonal, small off-diagonal → near-identity after normalisation.
-        self.W_raw = nn.Parameter(torch.zeros(n_streams, n_streams))
+        self.W_raw = nn.Parameter(torch.empty(n_streams, n_streams))
+        self.W_gate_raw = nn.Parameter(torch.empty(()))
         with torch.no_grad():
-            self.W_raw.diagonal().fill_(10.0)
+            init_near_identity_sinkhorn_raw(self.W_raw, self.identity_epsilon)
+            self.W_gate_raw.copy_(
+                logit(torch.tensor(self.gate_init, device=self.W_gate_raw.device))
+            )
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
         """
@@ -221,14 +244,17 @@ class SinkhornMixReduction(nn.Module):
             h       : (B, T, d_model)
         """
         # Project to Birkhoff polytope
-        W = sinkhorn(self.W_raw, n_iters=self.sinkhorn_iters)   # (n, n)
+        W_projected = sinkhorn(self.W_raw, n_iters=self.sinkhorn_iters)   # (n, n)
+        gate = torch.sigmoid(self.W_gate_raw)
+        W_identity = torch.eye(self.n_streams, device=streams.device, dtype=streams.dtype)
+        W = (1.0 - gate) * W_identity + gate * W_projected
 
         # Reweight streams: output_stream_i = sum_j  W[i,j] * input_stream_j
         # Then sum over the output stream dimension to produce a single vector.
         # This is equivalent to a learned weighted sum with doubly stochastic weights.
         B, T, n, d = streams.shape
         mixed = torch.matmul(W, streams.reshape(B * T, n, d))
-        return mixed.reshape(B, T, n, d).sum(dim=2)              # (B, T, d)
+        return mixed.reshape(B, T, n, d).mean(dim=2)             # (B, T, d)
 
     def mixing_weights(self) -> torch.Tensor:
         """
@@ -240,7 +266,17 @@ class SinkhornMixReduction(nn.Module):
         that the learned mixing is doing something the sum cannot.
         """
         with torch.no_grad():
-            return sinkhorn(self.W_raw, n_iters=self.sinkhorn_iters)
+            projected = sinkhorn(self.W_raw, n_iters=self.sinkhorn_iters)
+            gate = torch.sigmoid(self.W_gate_raw)
+            identity = torch.eye(
+                self.n_streams,
+                device=projected.device,
+                dtype=projected.dtype,
+            )
+            return (1.0 - gate) * identity + gate * projected
+
+    def diagnostics(self) -> dict[str, float]:
+        return doubly_stochastic_diagnostics(self.mixing_weights())
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +328,8 @@ class mHCTrunk(nn.Module):
                 ffn_mult=cfg.ffn_mult,
                 max_seq_len=cfg.max_seq_len,
                 sinkhorn_iters=cfg.sinkhorn_iters,
+                identity_epsilon=cfg.mhc_identity_epsilon,
+                gate_init=cfg.mhc_gate_init,
             )
             for i in range(cfg.n_layers)
         ])
@@ -301,7 +339,8 @@ class mHCTrunk(nn.Module):
             self.reduction = SumReduction(cfg.n_streams, cfg.d_model)
         elif cfg.reduction == "mix":
             self.reduction = SinkhornMixReduction(
-                cfg.n_streams, cfg.d_model, cfg.sinkhorn_iters
+                cfg.n_streams, cfg.d_model, cfg.sinkhorn_iters,
+                cfg.mhc_identity_epsilon, cfg.mhc_gate_init,
             )
         else:
             raise ValueError(f"Unknown reduction: {cfg.reduction!r}")
@@ -318,12 +357,7 @@ class mHCTrunk(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Scale LM head down by 1/sqrt(n_streams) to compensate for the
-        # n-fold magnitude increase from summing n identical streams at init.
-        # Both reduction conditions apply the same correction so their output
-        # distributions are variance-equivalent at step 0.
-        with torch.no_grad():
-            self.lm_head.weight.mul_(1.0 / math.sqrt(self.n_streams))
+        init_gpt_style_weights(self, len(self.blocks))
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -357,6 +391,31 @@ class mHCTrunk(nn.Module):
         hidden = self.reduction(streams)                        # (B, T, d)
 
         return hidden   # caller applies final_norm + lm_head
+
+    def mhc_diagnostics(self) -> dict[str, float]:
+        stats: dict[str, list[float]] = {
+            "row_err": [],
+            "col_err": [],
+            "diag_mass": [],
+            "entropy": [],
+            "sigma_1": [],
+            "sigma_2": [],
+        }
+        for block in self.blocks:
+            for residual in (block.attn_mhc, block.ffn_mhc):
+                diag = residual.diagnostics()
+                for key, value in diag.items():
+                    stats[key].append(value)
+
+        summary = {
+            f"mhc_{key}": sum(values) / len(values)
+            for key, values in stats.items()
+            if values
+        }
+        if isinstance(self.reduction, SinkhornMixReduction):
+            for key, value in self.reduction.diagnostics().items():
+                summary[f"mhc_reduction_{key}"] = value
+        return summary
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +500,7 @@ class mHCWithMTP(nn.Module):
             "mtp_loss":         mtp_loss,
             "per_depth_losses": per_depth,
             "mix_weights":      mix_weights,
+            "mhc_diagnostics":  self.trunk.mhc_diagnostics(),
         }
 
     def infer(self, input_ids: torch.Tensor) -> torch.Tensor:
